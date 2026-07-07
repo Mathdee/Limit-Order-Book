@@ -1,3 +1,10 @@
+# Table of Contents
+
+- [July 5 2026](#july-5-2026)
+- [July 6 2026](#july-6-2026)
+
+---
+
 # July 5 2026
 
 I read the blog posts of `wkselph` on the waybackMachine: <https://web.archive.org/web/20110219155647/http://howtohft.wordpress.com/author/howtohft/>
@@ -148,7 +155,7 @@ A LOB has three main operations: add, cancel, execute. (all should aim to be imp
 
 Because each operation has a unique Orderid , the best way to track them is a hash table (`std::unordered_map<>`).
 
-Trading Models will ask: “what are the best bid and offer?”, “how much volume is there between prices A and B?” or “what is order X’s current position in the book?”.
+Trading Models will ask: "what are the best bid and offer?", "how much volume is there between prices A and B?" or "what is order X's current position in the book?".
 
 So we need data structures that make these queries fast.
 
@@ -216,3 +223,143 @@ Couple values to keep in mind:
 - individual messages average about 20 bytes.
 - Bursts of 100,000–200,000 messages per second.
 - 20+ gigabytes/day of ITCH data with spikes of 3 megabytes/second or more.
+
+---
+
+# July 6 2026
+
+Looked into ITCH protocol from: <https://databento.com/microstructure/itch> and
+<https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification.pdf>
+
+The ITCH file is a binary file, each byte is data encoding numbers, prices, orderIDS and more...
+The parser code I have written today allows us to read the binary file efficiently.
+
+There are 2 ways to receive the data:
+
+- **Buffered reading**: The program reads small parts of the file in memory as it needs them.
+- **Memory-mapped file**: The Operating System makes it look like the file is already in memory, the program can access it like a normal array.
+
+Also learned that the messages in ITCH are encoded like this `[2 bytes = length N] [N bytes = message body]`.
+
+So going through the file looks like:
+
+1. read the 2 bytes, thats the length.
+2. the next `length` bytes are the message.
+3. the first byte gives us the message type.
+4. then move pointer by `lenght` bytes forward.
+5. Keep doing this until we reach the end.
+
+So first coding today, `parser.cpp`.
+
+I am going with the Memory-mapped file approach because I don't have to worry about buffer management and chunk loading, the file is directly parsed, and the OS handles all the loading and caching for us, which makes it more efficient for a +7GB file.
+
+CPP functions I used:
+
+- `std::fopen()` allowed me to open my ITCH file. // `fclose()`: when we're done with it we close it.
+- `fstat(file, &struct)`: assigns the metadata of that file (size, permissions, timestamp, type) to a declared struct. `struct.st_size;` returns size; (TO CALL IT: `#include <sys/stat.h>`)
+- `mmap()`: maps the file directly into your process's virtual memory so you can access it like a normal byte array.
+  - `munmap()`: removes the file from memory.
+
+Comparison of both approaches:
+
+```text
+The mmap version I implemented:            The buffered reader implementation:
+mmap entire file                                          read 16 MB
+ ↓                                                            ↓ 
+pos = 0                                                     parse
+ ↓                                                            ↓ 
+parse until pos == file_size                          carry leftover bytes
+                                                              ↓ 
+                                                        read next 16 bytes
+                                                              ↓ 
+                                                            parse
+```
+
+Parser Flow:
+
+```text
+open()
+ ↓ 
+fstat()
+ ↓ 
+mmap()
+ ↓ 
+  pos = 0
+    ↓ 
+ [read length]
+ [read type]
+ [count]
+ [advance]
+    ↓ 
+ end of file
+    ↓   
+  munmap()
+    ↓ 
+  close()
+```
+
+So what I built today:
+
+- [X] Open file
+- [X] Get size
+- [X] mmap file
+- [X] Walk messages with pos
+- [X] Count message types
+- [X] Benchmark messages/sec
+
+OUTPUT first version (dry-run):
+
+```text
+mathdee@LaptopMathijs:/mnt/c/Users/faila/OneDrive/Documents/Project SPSC RIngBuffer/lob-repo$ ./build/parser
+J: 34
+Q: 17836
+C: 99917
+I: 4024315
+K: 3
+V: 1
+P: 1218602
+E: 5722824
+F: 1485888
+X: 2787676
+U: 21639067
+D: 114360997
+A: 117145568
+L: 215161
+Y: 9013
+H: 8966
+R: 8906
+S: 6
+Total messages: 268744780
+Messages/sec: 4.03391e+06
+```
+
+Time is pretty low for a dry run, the culprit is most likely: `std::unordered_map<char, uint64_t> counts;`.
+First of all its in the HEAP so scattered nodes, each access is probably a cache miss, AND it looks up total_messages nb of times.
+
+### FIX I HAVE IN MIND
+
+- Use a flat array of size 256, everytime we see a type, `array[type]++`;
+- Then we return those that have `array[type] > 0`;
+- 256 indexes in `uint64_t` so the total bytes is 2048 bytes = 2 KB -> FITS inside L1 cache which has 32KB of space.
+
+Memory layout comparison:
+
+```text
+Before: unordered_map                  After: uint64_t counts[256]
+
+unordered_map                          Stack:
+     |                                 +----------------+
+     v                                 | counts[0]      |
+  heap nodes                           | counts[1]      |
+     |                                 | counts[2]      |
+     v                                 | ...            |
+ [key][value][pointer]                 | counts[255]    |
+                                       +----------------+
+
+  Cache misses on every lookup         Everything contiguous in L1 cache
+```
+
+| Metric          | Before (`unordered_map`) | After (`counts[256]`) |
+| --------------- | ------------------------ | --------------------- |
+| Messages/sec    | 4.03391e+06              | 3.61513e+07           |
+| Improvement     |                          | **x9**                |
