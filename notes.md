@@ -2,6 +2,7 @@
 
 - [July 5 2026](#july-5-2026)
 - [July 6 2026](#july-6-2026)
+- [August 7 2026](#august-7-2026)
 
 ---
 
@@ -363,3 +364,105 @@ unordered_map                          Stack:
 | --------------- | ------------------------ | --------------------- |
 | Messages/sec    | 4.03391e+06              | 3.61513e+07           |
 | Improvement     |                          | **x9**                |
+
+
+# August 7 2026
+
+Pffff, pretty long break I took, let's not do that again !!
+
+First thing I did, re-read: https://web.archive.org/web/20110219163448/http://howtohft.wordpress.com/2011/02/15/how-to-build-a-fast-limit-order-book/
+
+rewriting what I forgot:
+  The LOB has to be perfect and an optimized data structure because its the primary source of market information for trading models.
+
+  Total volume of data per day is around 30+ GB nowadays, probably will be more with the markets looking into expanding to 23hour days.
+  There are 3 main operations the LOB needs : add, cancel, execute. (need them all in O(1) for speed).
+  
+  According to wkselph, the most seen operations are add and cancel, so the focus will be more on making sure both are optimized and fastest if we have to choose what operations we have to allocate in L1 cache.
+
+  Quick recap of what the 3 operations do:
+  - add: places an order at the end of a list of orders to be executed at a particular limit price.
+  - cancel: removes an order from anywhere in the book.
+  - execute: removes an order from the inside of the book, inside of the book is the oldest buy order at the highest buying price and the oldest sell order at the lowest selling price.
+
+  So each operation is keyed of an id number, so according to wkselph the hash table would make the most sense because the data structure allows for unique keys and each key pointing is to a non-unique value.
+
+  The rest is same thing I wrote down July 5th.(going to read that again).
+
+SOOOOOO, quick refresh on the specs, going to write what each symbol means:
+   - A: This adds a new anonymous visible limit order to the book with a unique tracking ID.
+   - F: same as A but limit order is visible, and includes the firm's specific MPID attribution.
+   - E: This reduces an order's resting size after a partial/full execution at its original displayed price.
+   - C: This logs partial/full execution of a resting order at a price different from its original display price.
+   - X: This reduces the visible size of a resting order due by N to a partial cancellation.
+   - D: This removes a resting order entirely from the book because it was fully canceled or deleted.
+   - U: This replaces an existing order with a new tracking ID to update its prize or share size in an instant.
+
+
+So what am I building now then:
+  today:
+[X] - OrderBook: unordered_map<order_ref->Order> + map of price levels ( bids/asks with FIFO queues).
+[X] - Operations: add(A/F), cancel(X), delete(D), replace(U), execute(E/C).
+[X] - Filter one symbol (AAPL via stock_locate from R), i'll ignore the rest.
+[X] - Connect to the parser: decode the messaged and update book.
+  other day:
+[ ] - Debugging
+[ ] - Running a full day on AAPL
+
+notes for building:
+  - each order looks like this: "ID42, buy, 100 shares at 150$"
+  - the price levels are shelves each containing a list of identical buy prices, FIFO layout so first order in the shelve gets served first.
+  - lookup binder allows for quick order lookup because operations only give us the ID, not the price.
+  - Why am I using two maps for bids and asks instead of one? Because they will now sort in opposite directions for their best bid(highest buy price) and best ask (lowest sell price).
+  /*
+    Let's visualize it rq:
+    add 3 orders:
+    order_:
+        101 -> {Buy, $150, 200 shares}
+        102 -> {Buy, $150, 50 shares}
+        201 -> {Sell, $151, 100 shares}
+
+    bids_: 
+        150 -> [101, 102] (101 is first in, so also first out, DNF).
+
+    asks_:
+        151 -> [201].
+
+    */
+## What I built (so I can rebuild from scratch)
+### 1) OrderBook data layout (`src/order_book.hpp`)
+An order is just: id, side ('B'/'S'), price (ITCH int), quantity.
+The book keeps the SAME order in 2 places:
+  - orders_: unordered_map<id -> Order>  → fast find by ID (cancels/executes only give ID)
+  - bids_ / asks_: map<price -> deque of ids> → shelves sorted by price, FIFO line at each price
+Why 2 maps not 1: best bid = highest buy, best ask = lowest sell. Easier separate.
+helper book_side('B'/'S') picks bids_ or asks_.
+### 2) Ops (bookkeeping only, NO matching yet)
+  - add: put in orders_, push_back id on that price shelf
+  - delete_order (D): find order, remove id from its shelf, erase from orders_. If shelf empty, erase price level.
+  - reduce (X/E/C): shrink qty. if shares >= qty → delete fully. Same function for cancel and execute for now.
+  - replace (U): NOT an edit. Save side from old order FIRST, delete old id, add new id at BACK of queue (loses time priority). U message does not send side.
+remove_from_level scans the deque for the id (O(n) for now, linked list later if I care).
+### 3) AAPL filter in parser
+R messages map stock_locate → ticker. Ticker is 8 chars space-padded so compare to "AAPL    " (4 spaces).
+I saved aapl_locate. For A/F/E/C/X/D/U, read locate from body+1, skip if not AAPL.
+Got: AAPL locate = 13
+### 4) Wire parser → book
+After filter passes, switch on type:
+  A/F → book.add
+  X/E/C → book.reduce
+  D → book.delete_order
+  U → book.replace (OrderReplace: orig_order_ref, new_order_ref, price, shares)
+C++ tip that bit me: each case that does `auto m = ...` needs its own `{ }` or all the m's fight each other.
+### Results after full day
+  AAPL messages kept: 1512179
+  Missing order refs: 0
+So every E/X/D/U for AAPL hit an order I actually had. That's already a strong check.
+### Rebuild checklist
+1. Order + OrderBook with orders_/bids_/asks_
+2. add / remove_from_level / delete_order / reduce / replace
+3. In parser loop: find AAPL from R, filter by locate
+4. switch decode → book calls
+5. count missing_references, want 0
+6. next: assert best bid < best ask after every update
+

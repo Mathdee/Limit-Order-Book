@@ -2,6 +2,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "itch_messages.hpp"
+#include "order_book.hpp"
 
 #include <unordered_map>
 #include <iostream>
@@ -9,6 +10,8 @@
 #include <filesystem>
 #include <cstdint>
 #include <array>
+#include <cstring>
+#include <chrono>
 
 
 int main(){
@@ -56,9 +59,16 @@ int main(){
     uint64_t total_messages = 0;
     size_t pos = 0;
 
-    auto start = std::chrono::high_resolution_clock::now();
+     //AAPL locate, state
+    uint16_t aapl_locate = 0;
+    bool have_aapl = false;
+    OrderBook book;
+    uint64_t aapl_messages = 0;
 
-    while(pos +2 <= size){ 
+    uint64_t missing_references = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();
+    while(pos +2 <= size){
 
         uint16_t length = itch::be16(data + pos);
         if(pos + 2 + length > size){
@@ -71,6 +81,65 @@ int main(){
         uint8_t type = body[0];
         counts[type]++;
         total_messages++;
+
+        //find AAPL's locate from Stock Directory
+        if (type == 'R') {
+            auto r = itch::StockDirectory::decode(body);
+            // exactly 8 chars: 'A' 'A' 'P' 'L' ' ' ' ' ' ' ' '
+            if (std::memcmp(r.stock.data(), "AAPL    ", 8) == 0) {
+                aapl_locate = r.stock_locate;
+                have_aapl   = true;
+                std::cout << "AAPL locate = " << aapl_locate << "\n";
+            }
+        }
+        //keep only AAPL order messages 
+        else if(type == 'A' || type == 'F'|| type == 'E' || type == 'C' || type == 'X' || type == 'D'|| type == 'U'){
+            uint16_t locate = itch::be16(body + 1);
+            if(have_aapl && locate == aapl_locate){
+                ++aapl_messages;
+                //also need to decode + book.add / reduce/ delete/ replace
+                switch (type) {
+                    case 'A': {
+                        auto m = itch::AddOrder::decode(body);
+                        book.add(m.order_ref, m.side, m.price, m.shares);
+                        break;
+                    }
+                    case 'F': {
+                        auto m = itch::AddOrderMPID::decode(body);
+                        book.add(m.order_ref, m.side, m.price, m.shares);
+                        break;
+                    }
+                    case 'X': {
+                        auto m = itch::OrderCancel::decode(body);
+                        if (!book.reduce(m.order_ref, m.cancelled_shares)) ++missing_references;
+                        break;
+                    }
+                    case 'E': {
+                        auto m = itch::OrderExecuted::decode(body);
+                        if (!book.reduce(m.order_ref, m.executed_shares)) ++missing_references;
+                        break;
+                    }
+                    case 'C': {
+                        auto m = itch::OrderExecutedWithPrice::decode(body);
+                        if (!book.reduce(m.order_ref, m.executed_shares)) ++missing_references;
+                        break;
+                    }
+                    case 'D': {
+                        auto m = itch::OrderDelete::decode(body);
+                        if (!book.delete_order(m.order_ref)) ++missing_references;
+                        break;
+                    }
+                    case 'U': {
+                        auto m = itch::OrderReplace::decode(body);
+                        if (!book.replace(m.orig_order_ref, m.new_order_ref, m.price, m.shares))
+                            ++missing_references;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+        }
 
         pos += 2 + length;
     }
@@ -89,6 +158,10 @@ int main(){
     std::cout<< "Total messages: " << total_messages << "\n";
 
     std::cout<< "Messages/sec: " << total_messages / seconds << "\n";
+
+
+    std::cout << "AAPL messages kept: " <<aapl_messages << "\n";
+    std::cout << "Missing order refs: " <<missing_references << "\n";
 
     std::cout << data[0] << "\n";
     munmap(data, size);
