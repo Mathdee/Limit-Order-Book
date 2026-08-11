@@ -66,6 +66,7 @@ int main(){
     uint64_t aapl_messages = 0;
 
     uint64_t missing_references = 0;
+    uint64_t invariant_fails = 0;
 
     auto start = std::chrono::high_resolution_clock::now();
     while(pos +2 <= size){
@@ -138,6 +139,21 @@ int main(){
                     default:
                         break;
                 }
+
+                if(!book.check_invariants()){
+                    ++invariant_fails;
+                    if(invariant_fails == 1){
+                        uint32_t bid = 0, ask = 0;
+                        bool high_bid = book.best_bid(bid);
+                        bool high_ask = book.best_ask(ask);
+
+                        std::cerr << "First invariant fail at message type = " << static_cast<char>(type)
+                                  << " bid = " << (high_bid? std::to_string(bid) : "none")
+                                  << " ask = " << (high_ask? std::to_string(ask) : "none")
+                                  << "\n";
+                        
+                    }
+                }
             }
         }
 
@@ -162,6 +178,7 @@ int main(){
 
     std::cout << "AAPL messages kept: " <<aapl_messages << "\n";
     std::cout << "Missing order refs: " <<missing_references << "\n";
+    std::cout << "Invariant failures: " << invariant_fails << "\n";
 
     std::cout << data[0] << "\n";
     munmap(data, size);

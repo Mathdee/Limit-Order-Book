@@ -3,6 +3,8 @@
 - [July 5 2026](#july-5-2026)
 - [July 6 2026](#july-6-2026)
 - [August 7 2026](#august-7-2026)
+- [August 10 2026](#august-10-2026)
+
 
 ---
 
@@ -465,4 +467,38 @@ So every E/X/D/U for AAPL hit an order I actually had. That's already a strong c
 4. switch decode → book calls
 5. count missing_references, want 0
 6. next: assert best bid < best ask after every update
+
+
+
+
+# August 10 2026
+What I still have to do:
+[ ] - Debugging
+[ ] - Running a full day on AAPL
+Quick recap until now: 
+- Learned the format of ITCH and I wrote a parser that reads the whole file and counts the message types.
+- Built a hash-map that tracks orders through their IDs, and also put orders on 2 different price levels for buy and sell.
+- Implemented operations: the big three - Add, Cancel & Execute. Also, Delete and Replace.
+- I filtered Nasdaq ITCH data to isolate "AAPL" by its unique barcode which is 13, allows it to ignore all the rest for easier debugging. From the millions of messages counted we succesfully parsed the +1.5million order messages from APPLE without a single error.
+
+What am I doing today:
+- after every AAPL message, check if top buy < top sell, orders are of valid size.
+
+I already got missing order refs: 0, so I didnt lose track of IDs
+Now we just have to make sure that every time best bid < best ask to make sure that our operations didn't mess with the prices.
+Implemented an invariant counter instead of writing asserts, reason is that if something fails only at the open I can still finish the whole day and also know how many fails I caused. Goal is a count of 0 before the day ends.
+
+
+Encountered some issues in writing the methods, didn't call by reference so after calling methods in `check_invariants()`, they wouldn't save to bid because they would be local and get deleted after the function went out of scope.
+
+Succesful results for today :).
+Missing order refs: 0
+Invariant failures: 0
+Means that it all checks out normally and the next step is going from only AAPL to all stocks in the NASDAQ ITCH data.
+
+Methods implemented today:
+`bool best_bid(uint32_t& price) const;`
+`bool best_ask(uint32_t& price) const;`
+`bool check_invariants() const;`
+
 

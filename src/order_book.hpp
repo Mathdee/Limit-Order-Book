@@ -13,6 +13,15 @@ struct Order{
 
 };
 
+/*
+4 most imporant invariants for a valid LOB.
+No Crossed Markets: The highest buy price (Best Bid) must always be strictly lower than the lowest sell price (Best Ask).
+Price Level Volume: The total shares listed at any price level must exactly equal the sum of the shares of all individual orders resting at that price level.
+Idempotent Order ID Mapping: Every active Order ID must map to exactly one price level, one side (buy/sell), and one stock ID.
+Non-Negative States: Order sizes, share volumes, and price level counts can never drop below zero.
+
+=======================================================================
+*/
 // Price level is: one price -> a line of order IDs at that price :)
 // use c++ api std::map<> with price as key, and a queue of order IDs std::deque<> as values.
 // std::map is also sorted so helps us find best bid/ask way easier later on.
@@ -25,6 +34,10 @@ public:
     bool delete_order(uint64_t id);
     bool reduce(uint64_t id, uint32_t shares);
     bool replace(uint64_t old_id, uint64_t new_id, uint32_t new_price, uint32_t new_quantity);
+
+    bool best_bid(uint32_t& price) const; // Highest buy price
+    bool best_ask(uint32_t& price) const; // Lowest sell price.
+    bool check_invariants() const;        // Checks if book is in a bad state.
 
 
 private: 
@@ -135,5 +148,48 @@ bool OrderBook::replace(uint64_t old_id, uint64_t new_id, uint32_t new_price, ui
     char side = ite->second.side; // save it before deleting
     delete_order(old_id);
     add(new_id, side, new_price, new_quantity);
+    return true;
+}
+
+bool OrderBook::best_bid(uint32_t& price) const{
+    if(bids_.empty()) return false;
+    price = bids_.rbegin()->first;
+    return true;
+}
+
+bool OrderBook::best_ask(uint32_t& price) const{
+    if(asks_.empty()) return false;
+    price = asks_.begin()->first;
+    return true;
+}
+
+
+/*
+1) no empty shelves left behind (should never happen if delete is correct)
+2) every order qty must be > 0 (0 should have been deleted)
+3) book must not be crossed when both sides exist
+*/
+bool OrderBook::check_invariants() const{
+    //1
+    for( const auto& [px, q]: bids_){
+        if(q.empty()) return false;
+    }
+    for( const auto& [px, q]: asks_){
+        if(q.empty()) return false;
+    }
+
+    //2
+    for(const auto& [id, o]: orders_){
+        (void)id;
+        if(o.quantity == 0 ){
+            return false;
+        }
+    }
+
+    //3
+    uint32_t bid = 0, ask = 0;
+    if(best_bid(bid) && best_ask(ask)){
+        if(bid >= ask) return false; // either crossed or locked.(crossed = bid >= ask)(locked = bid == ask).
+    }
     return true;
 }
