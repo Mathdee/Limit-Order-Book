@@ -4,7 +4,8 @@
 - [July 6 2026](#july-6-2026)
 - [August 7 2026](#august-7-2026)
 - [August 10 2026](#august-10-2026)
-
+- [August 12 2026](#august-12-2026)
+- [August 17 2026](#august-17-2026)
 
 ---
 
@@ -501,4 +502,238 @@ Methods implemented today:
 `bool best_ask(uint32_t& price) const;`
 `bool check_invariants() const;`
 
+
+# August 12 2026
+
+So what did I already do?
+- Wrote the parser, counted +260Million messages.
+- focused on Apple stocks and implemented the add, cancel, delete, replace and execute operations.
+- Ran a full day on AAPL and got 0 missing IDs and 0 invariant failures.
+
+
+Today I'm going to run the full day with all stocks, not only "AAPL". 
+And a thing I should add for today to make sure everything stays valid, for every execute and cancel I need to check,
+if it exists in book, its first in line at its price level, its the best price on that side.
+
+Ok so I am tracking R to see how many messages have been applied, also because it's running the whole file now instead of only one stock I wont check for all invariants every single time, I'll keep it simple and check only for best bid < best ask, should be faster because its a two map lookup.
+
+Ok after first run : `cmake --build build && ./build/parser`.
+The output is:
+```Python
+crossed book locate = 6286 type = A bid = 14200 ask = 13000
+A : 117145568
+C : 99917
+D : 114360997
+E : 5722824
+F : 1485888
+H : 8966
+I : 4024315
+J : 34
+K : 3
+L : 215161
+P : 1218602
+Q : 17836
+R : 8906
+S : 6
+U : 21639067
+V : 1
+X : 2787676
+Y : 9013
+Total messages: 268744780
+Messages/sec: 1.59463e+06
+Symbols (R): 8906
+Books seen: 8906
+Book messages applied: 263241937
+Missing order refs: 0
+Invariant failures: 8649
+```
+
+Used command : `/usr/bin/time -v ./build/parser 2>&1 | tail -n 30`
+Need to see if I am leaking orders, first step to identifying where the issue comes from.
+The output for that was:
+```Python
+Messages/sec: 1.55693e+06
+Symbols (R): 8906
+Books seen: 8906
+Book messages applied: 263241937
+Missing order refs: 0
+Invariant failures: 8649
+
+        Command being timed: "./build/parser"
+        User time (seconds): 159.45
+        System time (seconds): 12.29
+        Percent of CPU this job got: 99%
+        Elapsed (wall clock) time (h:mm:ss or m:ss): 2:52.67
+        Average shared text size (kbytes): 0
+        Average unshared data size (kbytes): 0
+        Average stack size (kbytes): 0
+        Average total size (kbytes): 0
+        Maximum resident set size (kbytes): 5945284
+        Average resident set size (kbytes): 0
+        Major (requiring I/O) page faults: 3
+        Minor (reclaiming a frame) page faults: 179896
+        Voluntary context switches: 43
+        Involuntary context switches: 725
+        Swaps: 0
+        File system inputs: 16099137
+        File system outputs: 0
+        Socket messages sent: 0
+        Socket messages received: 0
+        Signals delivered: 0
+        Page size (bytes): 4096
+        Exit status: 0
+```
+
+Okkkk, so what can I make of these numberrrss.
+First we have what we saw earlier, 8649 Invariant Failures in 8906 books. ~97% failure, which is too much.
+But we have 0 missing order refs so that means that every message operation found its order.
+Parsing isn't the issue here and hashing neither then.
+Hmmmmm, so the issue happens after, maybe it's how I manipulate the book?
+
+This many failures is probably a one time event happening in most books because it doesnt happen for every message.
+In `parcer.cpp` -  ++invariant_fails; happens at each bid >= ask.
+I wrote before that books fail invariants when they are crosses ( bid < ask>) or locked ( bid == ask).
+So havind bid >= ask will fire at crossed and at locks. 
+
+Quick note:
+ - `Crossed = bid > ask` — genuinely invalid, someone's buy price is higher than someone's sell price, the exchange should have matched them.
+ - `Locked = bid == ask` — buy and sell sitting at the exact same price. This is not invalid. Locked markets happen constantly in real exchange data, especially around the open, on thin/illiquid names, or with pegged/mid orders. NASDAQ ITCH books lock all the time without anything being wrong.
+
+Crosses can be a bug, locks aren't bugs usually. So I need to track both separately to be able to identify the issue.
+Wrote the changed code in `parser.cpp`.
+```CPP
+  uint32_t bid = 0, ask = 0;
+  if(book.best_bid(bid) && book.best_ask(ask)){
+      if(bid < ask) ++crossed_count;
+      if(bid == ask) ++locked_count;
+  }
+```
+### Results:
+8649 Invariant Failures separate into: 
+ - Crossed counted: 8579
+ - Locked counted: 70
+
+Ok, so I do not think that my code is the issue because the failures happen at every symbol cleanly, so its not random. So the issue would then be the data?
+Sooo, What is true about every stock, every day, that I haven't taken into account yet, that would be where the solution is normally.
+NASDAQ ITCH also saves the `pre-market`, where orders are already coming in and being added to the book, but nothing is getting matched or cleared. The orders pile up waiting for the market to open.
+Now once it opens, NASDAQ runs `opening cross`, which looks at all the piled up orders and it matches them all together. It is only after that that the book behaves correctly and bid < ask.
+
+And this would explain why nearly every symbol(~96%) shows a crossed book once, right before the market opens.
+So the way to do so would be to start checking for invariants after the market opens. To do so we must track the message 'S' which is System event messages and then look for the message 'Q' which represents "Start of Market Hours" so only when market_open = true; can we check for invariants.
+
+I implemented it in `parser.cpp`. Now run it again and see, the crossed count should drastically reduce.
+### Results:
+ - Missing order refs: 0
+ - Crossed counted: 8535
+ - Locked counted: 70
+Still nothing, After reading into it, this is actually just what a raw, unfiltered ITCH feed genuinely looks like, the exchange reports the order landing on the book and its correcting execution as two separate sequential messages, it checks book validity in the split second between them, which is why I get a  "crossed" state that was never real from the exchange's point of view. 
+I am going to assume it is because my parser is just fast enough to be able to catch the feed mid-event.
+
+
+
+
+# August 17 2026
+
+Ayeee, another day, another line of code to write am I right, heheheh ._.
+
+Last time I ended on assuming things but I thought about it and because I have time to check it and I do not know nearly enough to assume things I am going to test it to make sure I understand what is happening.
+
+8535 books ended up `crossed` (best bid > best ask) which should never happen in a healthy book.
+I need to make sure that this isn't a bug or if it's how the exchange data looks.
+
+read this: `https://softwareengineering.stackexchange.com/questions/412908/what-makes-a-before-after-vs-only-before-approach-to-logging-more-effective`
+
+The before/after logger will only turn on when something triggers it and it will record the next order that is logged.
+First I implemented `pending_cross` an unordered_map from stock symbol to the details of the crossing event -> what message caused it, what time(nanoseconds), order ID?, bad bid/ask?
+So every time yhe book detects a cross (bid > ask), I save the symbol in `pending_cross` only if it wasn't already there. This allows me to only save the first cross for that symbol and not every one after.
+
+I then check at the top of the message-processing loop if the symbol is sitting in the waiting room?
+Because this message is the very next thing that happened to the symbol after it got flagged I print both events and remove them from `pending_cross` so I don't log it again.
+
+The idea is to catch the issue, then catch whatever comes after and see if the next order is fixing it or making it worse.
+
+The reason I did this is because I thought that maybe the exchange sends order landed and order got executed as two separate messages and that my program was so fast that it checked the book state in the very tiny gap between them. And if that were true, the crossing message is `A` and the very next message for that symbol is `E`/`C`/`X` that fixes it, ~seconds later.
+
+### Results after running code:
+```Python
+    ref=10234516 dt_ns=2893879
+    CROSS locate=7598 first=A ts=34201487889885 ref=10234516 bid=65100 ask=65000 | next=A ts=34201487911324 ref=10234520 dt_ns=21439
+    CROSS locate=7598 first=A ts=34201487911324 ref=10234520 bid=65100 ask=65000 | next=A ts=34201487912386 ref=10234524 dt_ns=1062
+    CROSS locate=6286 first=A ts=34201538619358 ref=7968431 bid=14400 ask=13000 | next=A ts=34201538644300 ref=7968439 dt_ns=24942
+    CROSS locate=6286 first=A ts=34201538644300 ref=7968439 bid=14400 ask=13000 | next=A ts=34201538646880 ref=7968443 dt_ns=2580
+    CROSS locate=6286 first=A ts=34201538646880 ref=7968443 bid=15100 ask=13000 | next=A ts=34201538661324 ref=7968451 dt_ns=14444
+```
+
+Here I see that as speculated, the crossing message was `A`. However so was the next message, this happened 5 times in a row. New unrelated orders just keep landing on top of it which directly ends my assumption because nothing is fixing itself. The book is just crossed while new orders pile on top.
+Also something else I spotted is the time, when I convert `34201487889885` nanoseconds into the time of day I get `09:30:01` for all of them with just microsecond gaps. This shows that it's all happening right as the market opens and not throughout the day.
+
+So, after doing more reading into NASDAQ ITCH, I realised that each individual stock runs its own auction at 9:30 AM which is when all the pre-market piled-up orders get matched against each other in one batch. So we have to start looking when a specific stock is done with their auction and starts trading normally. the message type `H` is for the stock trading actions and thus we need to look for the flag `T` which stands for "now trading".
+
+My issue was that I checked `market_open` one time for all stocks, but instead I need to check if each stock has finished their own auction. 
+
+## So let's implement that too.
+Had to implement a new decode struct in `itch_messages.hpp` for `H`, switched `bool market_open = false` with `std::unordered_map<uint16_t, bool> trading;` to track individual stocks.
+Added a new `else if(type == 'H){}` that sets true or false based on `h.trading_state == 'T'`
+
+Now time to rerun and see what we come up with. Normally I should have 0 crossed.
+
+### Results:
+```Python
+    CROSS locate=8900 first=C ts=36022633521012 ref=10303868 bid=147500 ask=10000 | next=C ts=36022633526282 ref=10303880 dt_ns=5270
+    CROSS locate=8900 first=C ts=36022633526282 ref=10303880 bid=147500 ask=10000 | next=C ts=36022633526540 ref=10303864 dt_ns=258
+    CROSS locate=8900 first=C ts=36022633526540 ref=10303864 bid=147500 ask=10000 | next=C ts=36022633528571 ref=10303860 dt_ns=2031
+    CROSS locate=1334 first=C ts=36287932322086 ref=39643245 bid=7900 ask=7700 | next=C ts=36287932322640 ref=42907457 dt_ns=554
+    CROSS locate=7241 first=C ts=36657018494017 ref=57550236 bid=184800 ask=160000 | next=C ts=36657018494251 ref=59836540 dt_ns=234
+    CROSS locate=7241 first=C ts=36657018494251 ref=59836540 bid=180000 ask=160000 | next=C ts=36657018495449 ref=56247932 dt_ns=1198
+    CROSS locate=7241 first=C ts=36657018504747 ref=56458584 bid=176000 ask=160000 | next=C ts=36657018505941 ref=57347400 dt_ns=1194
+    CROSS locate=7241 first=C ts=36657018505941 ref=57347400 bid=176000 ask=160000 | next=C ts=36657018506198 ref=57672948 dt_ns=257
+    CROSS locate=7241 first=C ts=36657018506198 ref=57672948 bid=176000 ask=160000 | next=C ts=36657018507337 ref=57736116 dt_ns=1139
+    CROSS locate=7241 first=C ts=36657018507337 ref=57736116 bid=176000 ask=160000 | next=C ts=36657018508540 ref=58788348 dt_ns=1203
+    CROSS locate=7241 first=C ts=36657018508540 ref=58788348 bid=176000 ask=160000 | next=C ts=36657018530068 ref=58912508 dt_ns=21528
+    CROSS locate=7241 first=C ts=36657018530068 ref=58912508 bid=175600 ask=160000 | next=C ts=36657018531155 ref=59131588 dt_ns=1087
+    CROSS locate=7241 first=C ts=36657018531155 ref=59131588 bid=175000 ask=160000 | next=C ts=36657018532358 ref=57926808 dt_ns=1203
+```
+ - `Crossed counted: 634`
+ - `Locked counted: 8`
+
+So we removed 7901 crossed counts. A 92.5% decrease which is good. 
+Looking at the timestamps, they are around `10:00 AM` which is a whole 30 minutes after each individual auction end. Thus, opening-auction problem I tried to solved was solved !!!!!.
+
+The current crossed message type is `C` which stands for Order Executed with Price.
+
+I looked more into it and foudd this article: `https://onlinelibrary.wiley.com/doi/full/10.1111/jfir.12414`.
+
+So basically what it is:
+ - An `iceberg/reserve` order is one large order where we can only see a small portion of it in the public order book. The rest is hidden reserve quantity.
+ - Looks like this:
+   - Total Order = 100,000 shares
+   - Visible = 1,000 shares
+   - Hidden = 99,000 shares
+ - When the 1,000 visible shares are consumed the exchange replenishes the visible quantity from the hidden reserve. Repeats until hidden is empty.
+ - The visible quantity can be randomized, isn't always the same amount.
+
+Need to check if the remaining 634 crosses are caused by iceberg/reserves orders.
+To do so we need to look for a pattern that would allow me to assure that the leftover crosses are consistent with reserve/iceberg replenishemnt.
+Pattern: execution -> new order at same price -> execution -> replenishment
+Doing this check will allow me to infer it from the pattern but I won't be able to 100% prove that the hidden portion exists only from ITCH.
+
+## Proving the Iceberg Theory
+To actually test this, I stopped trying to guess a cutoff time and just logged the raw time deltas (`dt_ns`) and "chain lengths" (how many times the exact same price/side got executed and replenished back to back) to a CSV to see what the distribution actually looked like. 
+
+If this was just random humans or external algos reacting to a trade, there would be a wide spread of times due to network jitter, and the chains would get interrupted constantly.
+
+### Results from the CSV:
+* **Total "Refills" (Chain > 0)**: 236,401
+* **Median Refill Time**: 82.3 µs
+* **Max Chain Length**: 500 (for locate 4169)
+
+The histogram showed a massive, extremely tight cluster of refill times between 10µs and 100µs. That is practically instantaneous. 
+
+The chains confirm the mechanism. A chain of 500 means the exact same price and side got hit and replenished 500 times in a row without a single external order landing elsewhere to break the sequence. 
+
+THUS, Humans or external algorithms cannot perfectly time 500 consecutive sub-100µs round-trips over a network. The only thing capable of that microscopic, deterministic consistency is the NASDAQ matching engine itself, executing a hardcoded `if (reserve > 0) { replenish(); }` hot path entirely in memory. 
+
+ITCH will never give me a boolean `is_iceberg` flag because that defeats the whole point of a hidden reserve. But the results I got, but the sub-100µs latencies and the unbroken 500-length chains are strong, hard-to-explain-otherwise evidence that this is what's happening, and it accounts for the residual crosses.
+
+Pff, long and hard but we got there.
 

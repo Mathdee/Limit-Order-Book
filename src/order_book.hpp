@@ -39,6 +39,9 @@ public:
     bool best_ask(uint32_t& price) const; // Lowest sell price.
     bool check_invariants() const;        // Checks if book is in a bad state.
 
+    bool price_of(uint64_t id, uint32_t& price, char& side) const;
+
+
 
 private: 
     std::unordered_map<uint64_t, Order> orders_;
@@ -191,5 +194,13 @@ bool OrderBook::check_invariants() const{
     if(best_bid(bid) && best_ask(ask)){
         if(bid >= ask) return false; // either crossed or locked.(crossed = bid >= ask)(locked = bid == ask).
     }
+    return true;
+}
+
+bool OrderBook::price_of(uint64_t id, uint32_t& price, char& side) const{
+    auto ite = orders_.find(id);
+    if(ite == orders_.end()) return false;
+    price = ite->second.price;
+    side = ite->second.side;
     return true;
 }

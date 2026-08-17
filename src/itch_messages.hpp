@@ -485,4 +485,40 @@ struct OrderReplace {
     double price_dollars() const noexcept { return price / 10000.0; }
 };
 
+// ============================================================================
+// H — Stock Trading Action  (body: 25 bytes)
+// ============================================================================
+//
+// Announces a per-symbol trading state change.
+// trading_state values:
+//   'H' = Halted
+//   'P' = Paused
+//   'Q' = Quotation only (pre-open / pre-auction)
+//   'T' = Trading (this symbol's own opening cross has completed)
+
+struct StockTradingAction {
+    uint16_t stock_locate;
+    uint16_t tracking_num;
+    uint64_t timestamp_ns;
+    char     trading_state;
+
+    // Offsets:
+    //  [0]      type 'H'
+    //  [1..2]   stock_locate
+    //  [3..4]   tracking_num
+    //  [5..10]  timestamp_ns
+    //  [11..18] stock (8 bytes) — not needed, we have locate
+    //  [19]     trading_state
+    //  [20]     reserved
+    //  [21..24] reason (4 bytes) — not needed
+    static StockTradingAction decode(const uint8_t* msg) noexcept {
+        return {
+            be16(msg + 1),
+            be16(msg + 3),
+            be48(msg + 5),
+            static_cast<char>(msg[19])
+        };
+    }
+};
+
 } // namespace itch
