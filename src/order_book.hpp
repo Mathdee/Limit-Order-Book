@@ -1,17 +1,19 @@
 #pragma once
 
+#include <order.hpp>
+
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <unordered_map>
 
-struct Order{
-    uint64_t    id;         //order reference
-    char        side;       //'B' = buy
-    uint32_t    price;      // ITCH integer price (is 1/10000 of a dollar)
-    uint32_t    quantity;   // shares still resting on the book
+// struct Order{
+//     uint64_t    id;         //order reference
+//     char        side;       //'B' = buy
+//     uint32_t    price;      // ITCH integer price (is 1/10000 of a dollar)
+//     uint32_t    quantity;   // shares still resting on the book
 
-};
+// };
 
 /*
 4 most imporant invariants for a valid LOB.

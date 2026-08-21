@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include "itch_messages.hpp"
 #include "order_book.hpp"
+#include "matching_engine.hpp"
 
 #include <unordered_map>
 #include <iostream>

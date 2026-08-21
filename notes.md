@@ -6,6 +6,8 @@
 - [August 10 2026](#august-10-2026)
 - [August 12 2026](#august-12-2026)
 - [August 17 2026](#august-17-2026)
+- [August 18 2026](#august-18-2026)
+
 
 ---
 
@@ -731,9 +733,151 @@ The histogram showed a massive, extremely tight cluster of refill times between 
 
 The chains confirm the mechanism. A chain of 500 means the exact same price and side got hit and replenished 500 times in a row without a single external order landing elsewhere to break the sequence. 
 
-THUS, Humans or external algorithms cannot perfectly time 500 consecutive sub-100µs round-trips over a network. The only thing capable of that microscopic, deterministic consistency is the NASDAQ matching engine itself, executing a hardcoded `if (reserve > 0) { replenish(); }` hot path entirely in memory. 
+THUS, Humans or external algorithms cannot perfectly time 500 consecutive sub-100µs round-trips over a network. "I won't be able to 100% prove that the hidden portion exists only from ITCH., executing a hardcoded `if (reserve > 0) { replenish(); }` hot path entirely in memory. 
 
 ITCH will never give me a boolean `is_iceberg` flag because that defeats the whole point of a hidden reserve. But the results I got, but the sub-100µs latencies and the unbroken 500-length chains are strong, hard-to-explain-otherwise evidence that this is what's happening, and it accounts for the residual crosses.
 
 Pff, long and hard but we got there.
 
+
+# August 18 2026
+
+Today, I am going to implement the matching engine. It does the opposite of `OrderBook`, it makes decisions. I will feed it a new order, and it has to figure out, right now, using only the orders already resting in the book: does this new order trade against anyone? With whom? How much? At what price? And if there's anything left over, where does it go?
+
+Watched: `https://www.youtube.com/watch?v=NH1Tta7purM`
+
+The main rule -> price-time priority.
+When three people have sell orders `{100:$10.00, 200:$10.00, 50:$9.99}` that are resting and someone submits a buy order `{120:$10.01}`:
+ - Price priority: First the buyer buys the best available price even if it was placed later, which is all of the 50:$9.99 order.
+ - Time priority: Second, the buyer still neds 70 shares to buy, it will always buy them from the oldest resting order which is `{100:$10.00}`.
+
+ The leftover is the 100-70 = 30 shares that the buyer bought. Order should have 30 shares now and keep same price and time priority.
+
+ Created the `matching_engine.hpp` file. Contains the submit() logic.
+ What it does:
+  - Look at best price level on the ask side.
+  - Is that ask price <= what the buyer wants to pay? if not, stop.
+  - If yes look at front of price level deque, oldest resting order.
+  - Match as much as possible: `std::min(incoming remaining, resting order's remaining)`
+  - Record a Fill. Reduce's both sides remaining quantity by the matched amount.
+  - When resting order hits 0, remove it from the book.
+  - If incoming order wants more, go back to first step because there can be more at the same price level.
+  - If incoming order is at 0, it stops.
+  - If all compatible price levels are at 0 and the incoming order still has quantity left, rest remainder in book as a new order.
+
+All this is mainly for buy orders. However sell orders are the same, only difference is check the bid side, match while bid price >= what the seller wants.
+
+Separated `struct Order{};` into its own file so `matching_engine.hpp` and `order_book.hpp` can both call it.
+## Connecting the Matching Engine & Unit Testing
+
+After writing `matching_engine.hpp`, I needed to hook it up to a buildable target. Up to this point, `CMakeLists.txt` only handled the `parser` executable, so I set up a dedicated target just for running tests.
+
+I used `add_library(itch_headers INTERFACE)`, which acts as an interface target carrying `target_include_directories`. Any target linking against it inherits `src/` on its include path—allowing `parser.cpp` and test files to use `#include "matching_engine.hpp"` directly without relative path workarounds (`../`).
+
+Added to `CMakeLists.txt`:
+
+```cmake
+add_executable(test_matching_engine test/test_matching_engine.cpp)
+target_link_libraries(test_matching_engine PRIVATE itch_headers)
+
+```
+
+Running `cmake --build build` now produces both executables.
+
+---
+
+## First Test: Full Match & Exhaustion
+
+The initial test in `test/test_matching_engine.cpp` covers a complete fill between one resting order and one incoming order. Rather than asserting loosely with `fills.size() == 1`, the test explicitly verifies the full match payload:
+
+* `incoming_id`
+* `resting_id`
+* `price`
+* `quantity`
+* Post-trade state: `best_bid` and `best_ask` are both empty.
+
+```text
+Tests Passed
+
+```
+
+The pipeline verified end-to-end: CMake target $\to$ compiler $\to$ assertions $\to$ matching engine logic.
+
+---
+
+## Implementing `cancel()` and `replace()`
+
+Before writing the remaining test suite, I added two core methods required to test cancel-execute races and priority loss on replacement:
+
+* **`cancel(id)`**: Mirrors the existing `OrderBook::delete_order` logic. Locates the order, identifies its side and price level, removes it from the level's `std::deque`, cleans up empty price levels, and erases the entry from `orders_`.
+* **`replace(old_id, new_id, new_price, new_quantity)`**: Handles replacement semantics matching ITCH `U` messages (cancel + new insert rather than an in-place update).
+* The side must be cached in a local variable **before** calling `cancel(old_id)`, as the record in `orders_` is destroyed during cancellation.
+* Constructs a new `Order` and calls `push_back` on the designated price level, placing it at the tail of the queue and resetting time priority even if the price remains unchanged.
+* Reuses `cancel()` internally to avoid duplicating order removal logic.
+
+
+
+Rerunning the initial test confirmed zero regressions.
+
+---
+
+## Targeted Test Suite
+
+Instead of writing repetitive cases, the test suite was split into 8 specific behavioral categories across 12 total tests:
+
+1. **Partial fills** (both incoming and resting partial executions)
+2. **Multi-level sweeps**
+3. **Time priority at identical price levels**
+4. **No-match scenarios / resting on an empty book**
+5. **Exact level exhaustion and memory cleanup**
+6. **Cancellations** (preventing subsequent matches and handling unknown IDs)
+7. **Order replacement priority resets**
+8. **Invariants** (ensuring the book never crosses after a sequence)
+
+---
+
+## Test Assertion Bug & Fix
+
+During multi-level sweep testing, an assertion failed:
+
+```text
+test_matching_engine: .../test/test_matching_engine.cpp:62: void test_sweep_multiple_levels(): Assertion `fills[0].price == 100 && fills[0].price == 101' failed.
+Aborted (core dumped)
+
+```
+
+**Root cause:** A copy-paste error in the test assertion itself evaluated `fills[0]` twice against two distinct values instead of inspecting `fills[1]`.
+
+**Fix:**
+
+```cpp
+assert(fills[0].price == 100 && fills[1].price == 101);
+
+```
+
+---
+
+## Final Results
+
+```text
+Tests Passed 
+test_incoming_partial_fill PASSED!!
+test_resting_partial_consumption PASSED!!
+test_sweep_multiple_levels PASSED
+test_time_priority_same_price PASSED!!
+test_no_match_price_too_low PASSED!!
+test_empty_book_rests_immediately PASSED!!
+test_exact_exhaustion_removes_level PASSED
+test_cancel_prevents_match PASSED!!
+test_cancel_unknown_id_fails PASSED!!
+test_replace_loses_time_priority PASSED!!
+test_book_never_crosses_after_sequence PASSED!!
+All tests passed.
+
+```
+
+**Summary:** 12/12 tests passing across all critical matching invariants, FIFO priority guarantees, and order lifecycle edge cases.
+
+```
+
+```
