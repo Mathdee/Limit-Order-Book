@@ -7,6 +7,7 @@
 - [August 12 2026](#august-12-2026)
 - [August 17 2026](#august-17-2026)
 - [August 18 2026](#august-18-2026)
+- [August 20 2026](#august-20-2026)
 
 
 ---
@@ -878,6 +879,215 @@ All tests passed.
 
 **Summary:** 12/12 tests passing across all critical matching invariants, FIFO priority guarantees, and order lifecycle edge cases.
 
+
+
+# August 20 2026
+Sooo, Today, to test the matching engine I built last time I'm gonna do some shadow matching. Basically,
+
+The problem is that my `MatchingEngine` has only been tested against scenarios I made myself. So I know it works on the things I thought to test but that doesn't really tell me if it works on the actual 268-million-message NASDAQ feed I have sitting on disk.
+So instead of making more tests myself I'm gonna use the real exchange data as the test.
+Whenever the real exchange executes a trade, which is an `E` or `C` message, I know that a resting order with a specific ID, price and quantity got hit.
+My engine doesn't know that this happened in the real market so I'm gonna make a fake incoming order that does the same thing. A `synthetic aggressor` on the opposite side at the same price for the same quantity and submit it to my engine.
+
+If the matching engine is correct it should find the same resting order and match the same quantity.
+So I'm checking:
+
+ - Did anything match
+ -  Did it match against the correct `resting_id`
+ -  Did it match the correct `quantity`
+
+I want to check the ID and quantity specifically because just checking if something matched isn't enough. It could match the wrong order or the wrong amount and I'd never catch it.
+For this to work the shadow book also has to look like the real book first. So whenever I see an `A` or `F` message I'm gonna put that order into the shadow engine too. Same as the normal book.
+Those orders should just rest until I get to an `E` or `C` message. Then I send the synthetic aggressor to the shadow engine and compare the result to what actually happened on the exchange.
+
+If it matches the same order for the same quantity then my engine is doing what I expect and if it doesn't then either I have a bug or there is something happening in the real exchange that I can't see from the ITCH data.
+So this should give me a much better test of the matching engine than just making up more scenarios myself.
+
+## First Attempt
+
+Added a matching-engine shadow, fed A/F messages in with `submit()`, and fired synthetic aggressors on E/C.
+
+Initial results:
+
+* **Shadow Agree:** 22,417
+* **Shadow Disagree:** 5,700,407
+* **Agreement Rate:** 0.391712%
+
+That was **0.39%**, far too low.
+
+## Bug 1: Shadow Never Shrinks
+
+`C`, `X`, `D`, and `U` were never touching the shadow. Only A/F/E messages affected it.
+
+As a result, the shadow kept accumulating dead orders that should have been gone and stopped mirroring the real book within seconds.
+
+### Fix
+
+Added `reduce()` to `MatchingEngine` and wired shadow `reduce`/`cancel`/`replace` operations into X/D/U. Also added the missing shadow check to C.
+
+## Rerun
+
+**Agreement: 0.6%**
+
+Barely moved.
+
+## Bug 2: `submit()` Isn't Passive
+
+`submit()` always tries to match before resting an order.
+
+Calling `shadow.submit()` for every A/F message therefore caused the shadow to match orders against **itself** before the real E messages showed up. I was effectively testing the engine against its own side effects rather than against the exchange.
+
+### Fix
+
+Added `rest()`, a pure insert with no matching.
+
+* A/F now use `rest()`.
+* Only E/C continue to call `submit()`.
+
+While fixing this, I also switched from one shared `MatchingEngine` to an `unordered_map<locate, MatchingEngine>` with one engine per symbol.
+
+That exposed another real bug: the single shared engine allowed two unrelated stocks to "trade" against each other if they happened to share a price.
+
+## Rerun
+
+**Agreement: 2.2%**
+
+Still far too low.
+
+## Bug 3: `submit()` With a Raw Quantity Spills Over
+
+Logged the first disagreement per symbol, using 30 samples and the same before/after technique as before.
+
+Every single sample showed:
+
+```text
+shadow_fills=0
 ```
 
+### Root Cause
+
+Feeding executed quantity directly into `submit()` causes the synthetic aggressor to sweep the book.
+
+With icebergs, visible quantity does not necessarily correspond 1:1 with executed quantity. The synthetic aggressor could therefore spill into the **next order**, consuming liquidity that was never actually touched.
+
+That spill cascaded forward through the rest of the file.
+
+## Real Fix
+
+The actual question turned out to be much simpler:
+
+> Is `order_ref` at the front of its price/side queue in the shadow?
+
+There is no need to construct a synthetic aggressor.
+
+Added a read-only:
+
+```cpp
+front_at(side, price, id)
 ```
+
+The new flow is:
+
+1. Check whether `order_ref == front_id`.
+2. Count agreement/disagreement.
+3. Call `shadow.reduce(order_ref, qty)` by ID either way so the shadow stays synchronized.
+4. Track a separate `shadow_missing` counter when `reduce()` finds nothing at all.
+
+This distinguishes two different failure modes:
+
+* **Wrong order:** the shadow found liquidity, but a different order was at the front.
+* **Missing order:** the shadow had no corresponding order at all.
+
+## Final Results
+
+| Metric          |       Result |
+| --------------- | -----------: |
+| Shadow Agree    |    5,729,669 |
+| Shadow Disagree |       93,072 |
+| Agreement Rate  | **98.4016%** |
+| Shadow Missing  |        **0** |
+
+**Final agreement: 98.4%.**
+
+The `shadow_missing = 0` result confirms that the A/F/X/D/U synchronization is solid.
+
+## Disagreement Analysis
+
+I checked the 30 disagreement samples. All had:
+
+```text
+shadow_fills=1
+```
+
+So the shadow consistently found something resting at the relevant price/side; it just wasn't always the correct order.
+
+A few locates — **2764, 8010, 5301, and 7462** — match symbols from the earlier iceberg refill-chain findings. That is consistent with the same underlying explanation: hidden liquidity can occasionally cause the exchange to match an order that my displayed-order-only priority reconstruction cannot account for.
+
+## Conclusion
+
+The remaining **~1.6% disagreement** is explainable by information that isn't present in the displayed order stream.
+
+This reconstruction therefore demonstrates that the **price-time ordering of the reconstructed displayed book matches the orders that actually executed with 98.4% agreement**.
+
+It does **not** prove that the exchange uses exactly the same internal matching algorithm, because the exchange's internal state and hidden liquidity are not directly observable.
+
+At this point, **98.4% with an explainable residual is a better result than chasing 100% with an increasingly complicated model.**
+
+## Benchmarking
+
+Needed throughput + latency for the matching engine itself, separate from the parser's messages/sec number, since that measures parsing overhead rather than the engine.
+
+Made `bench/bench_matching_engine.cpp`, its own executable following the same pattern as `test_matching_engine`. It feeds 1 million random synthetic orders directly into `submit()`, times each call individually with `chrono::high_resolution_clock`, stores all latencies in a vector, sorts it, and reads off percentiles by index (e.g. `latencies[N * 50 / 100]` for P50).
+
+Fixed the RNG seed to **42** so results are reproducible.
+
+## Segfault
+
+The first run crashed.
+
+The bug was:
+
+```cpp id="3v6x6w"
+latencies_ns[N * 999 / 100]
+```
+
+for P999. It should have been:
+
+```cpp id="z1ox9q"
+latencies_ns[N * 999 / 1000]
+```
+
+With `N = 1,000,000`, the incorrect calculation produced an index of **9,990,000** into a 1,000,000-element vector.
+
+`operator[]` does not bounds-check like `.at()` would, so it read invalid memory and the OS killed the process.
+
+Fixed the divisor.
+
+## Results
+
+```text id="0x5l6r"
+Orders submitted: 1000000
+Total Time (s): 0.201151
+Orders/sec: 4.9714e+06
+P50 latency (ns): 83
+P99 latency (ns): 570
+P999 latency (ns): 2131
+```
+
+That's approximately **5M orders/sec**, with a median latency of **83 ns per order**.
+
+The P50-to-P999 increase of roughly **25×** is expected rather than a bug. Some orders sweep more price levels or encounter cache misses, so the tail is naturally longer. A cheap median with a longer latency tail is the normal shape for this type of data structure.
+
+## Benchmark Environment
+
+* **CPU:** AMD Ryzen 7 6800H
+* **Compiler flags:** `-O3 -Wall -Wextra -Wpedantic`
+* **Orders:** 1,000,000
+* **RNG seed:** 42
+
+## Caveat
+
+This measures the **matching engine alone** with synthetic random orders in a tight loop.
+
+It does **not** measure real ITCH replay end-to-end, so these numbers exclude parsing, message decoding, and other feed-processing overhead.
+

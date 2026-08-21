@@ -6,6 +6,7 @@
 #include "matching_engine.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <iostream>
 #include <cstdio>
 #include <filesystem>
@@ -77,6 +78,27 @@ int main(){
     uint64_t crossed_count = 0;
     uint64_t locked_count = 0;
     std::unordered_map<uint16_t, bool> trading;
+
+    std::unordered_map<uint16_t, MatchingEngine> shadows;
+    uint64_t shadow_agree = 0;
+    uint64_t shadow_disagree = 0;
+    //uint64_t synthetic_id = 90000000000000ULL; //Makes sure no synthetic_id can accidentaly equal a real one 
+    //It matters because the real and fake ones both live in orders_.
+    uint64_t shadow_missing = 0; // order_ref wasn;t in shadows book at all
+
+    //DEBUGGING CODE:
+    struct DisagreeSample {
+        uint16_t locate;
+        uint64_t real_order_ref;
+        uint32_t expected_price;
+        uint32_t expected_qty;
+        size_t   fills_returned;
+        uint64_t got_resting_id; // 0 if fills empty
+        uint32_t got_qty;        // 0 if fills empty
+    };
+    std::vector<DisagreeSample> disagree_samples;
+    std::unordered_set<uint16_t> disagree_logged; // one sample per symbol
+    const size_t MAX_DISAGREE_LOG = 30;
 
     struct CrossEvent {
         char     type;
@@ -150,6 +172,7 @@ int main(){
         else if(type == 'A' || type == 'F'|| type == 'E' || type == 'C' || type == 'X' || type == 'D'|| type == 'U'){
             uint16_t locate = itch::be16(body + 1);
             OrderBook& book = books[locate];
+            MatchingEngine& shadow = shadows[locate];
 
             // If this locate crossed on a previous message, this is the "next" message, log it.
             auto pend = pending_cross.find(locate);
@@ -192,6 +215,7 @@ int main(){
                         }
 
                         book.add(m.order_ref, m.side, m.price, m.shares);
+                        shadow.rest(m.order_ref, m.side, m.price, m.shares);
                         break;
                     }
                     case 'F': {
@@ -210,10 +234,12 @@ int main(){
                             }
                         }
                         book.add(m.order_ref, m.side, m.price, m.shares);
+                        shadow.rest(m.order_ref, m.side, m.price, m.shares);
                         break;
                     }
                     case 'X': {
                         auto m = itch::OrderCancel::decode(body);
+                        shadow.reduce(m.order_ref, m.cancelled_shares);
                         if (!book.reduce(m.order_ref, m.cancelled_shares)) ++missing_references;
                         break;
                     }
@@ -221,6 +247,23 @@ int main(){
                     case 'E': {
                         auto m = itch::OrderExecuted::decode(body);
                         uint32_t px; char sd;
+                        if(book.price_of(m.order_ref, px, sd)){
+                            uint64_t front_id = 0;
+                            bool has_front = shadow.front_at(sd, px, front_id);
+                            if(has_front && front_id == m.order_ref){
+                                ++shadow_agree;
+                            } else {
+                                ++shadow_disagree;
+                                if (disagree_logged.insert(locate).second && disagree_samples.size() < MAX_DISAGREE_LOG) {
+                                    disagree_samples.push_back({locate, m.order_ref, px, m.executed_shares,
+                                        has_front ? 1u : 0u, has_front ? front_id : 0ULL, 0u});
+                                }
+                            }
+                            if(!shadow.reduce(m.order_ref, m.executed_shares)){
+                                ++shadow_missing;
+                            }
+                        }
+                    
                         if(book.price_of(m.order_ref, px, sd)){
                             uint64_t ts = itch::be48(body+5);
                             auto le = last_exec.find(locate);
@@ -234,8 +277,24 @@ int main(){
                         break;
                     }
                     case 'C': {
-                        auto m = itch::OrderExecutedWithPrice::decode(body);
+                        auto m = itch::OrderExecuted::decode(body);
                         uint32_t px; char sd;
+                        if(book.price_of(m.order_ref, px, sd)){
+                            uint64_t front_id = 0;
+                            bool has_front = shadow.front_at(sd, px, front_id);
+                            if(has_front && front_id == m.order_ref){
+                                ++shadow_agree;
+                            } else {
+                                ++shadow_disagree;
+                                if (disagree_logged.insert(locate).second && disagree_samples.size() < MAX_DISAGREE_LOG) {
+                                    disagree_samples.push_back({locate, m.order_ref, px, m.executed_shares,
+                                        has_front ? 1u : 0u, has_front ? front_id : 0ULL, 0u});
+                                }
+                            }
+                            if(!shadow.reduce(m.order_ref, m.executed_shares)){
+                                ++shadow_missing;
+                            }
+                        }
                         if(book.price_of(m.order_ref, px, sd)){
                             uint64_t ts = itch::be48(body+5);
                             auto le = last_exec.find(locate);
@@ -250,11 +309,13 @@ int main(){
                     }
                     case 'D': {
                         auto m = itch::OrderDelete::decode(body);
+                        shadow.cancel(m.order_ref);
                         if (!book.delete_order(m.order_ref)) ++missing_references;
                         break;
                     }
                     case 'U': {
                         auto m = itch::OrderReplace::decode(body);
+                        shadow.replace(m.orig_order_ref, m.new_order_ref, m.price, m.shares);
                         if (!book.replace(m.orig_order_ref, m.new_order_ref, m.price, m.shares))
                             ++missing_references;
                         break;
@@ -340,6 +401,26 @@ int main(){
         std::fclose(out);
     }
     std::cout << "Refill samples recorded: " << refill_samples.size() << "\n";
+
+    std::cout << "Shadow agree: " << shadow_agree << "\n";
+    std::cout << "Shadow Disagree: " << shadow_disagree << "\n";
+    std::cout << "Agreement Rate: " << (100.0 * shadow_agree / (shadow_agree + shadow_disagree)) << "\n";
+    std::cout << "Shadow missing (order not in shadow at all): " << shadow_missing << "\n";
+
+    // DEBUGGING CODE:
+    std::cerr << "\n--- First disagreement per symbol (up to 30) ---\n";
+    for (const auto& d : disagree_samples) {
+        std::cerr << "locate=" << d.locate
+                << " order_ref=" << d.real_order_ref
+                << " expected_price=" << d.expected_price
+                << " expected_qty=" << d.expected_qty
+                << " | shadow_fills=" << d.fills_returned
+                << " got_resting_id=" << d.got_resting_id
+                << " got_qty=" << d.got_qty
+                << "\n";
+    }
+
+
 
     std::cout << data[0] << "\n";
     munmap(data, size);

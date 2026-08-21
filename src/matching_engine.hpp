@@ -129,6 +129,35 @@ public:
         return true;
     }
 
+    /* Reduce(id, shares):
+       Partial size reduction.
+    */
+    bool reduce(uint64_t id, uint32_t shares){
+        auto ite = orders_.find(id);
+        if(ite == orders_.end()) return false;
+        if(shares >= ite->second.quantity){
+            return cancel(id);
+        }
+
+        ite->second.quantity -= shares;
+        return true;
+    }
+
+    void rest(uint64_t id, char side, uint32_t price, uint32_t quantity){
+        orders_[id] = Order{id, side, price, quantity};
+        auto& own_side = (side == 'B') ? bids_ : asks_;
+        own_side[price].push_back(id);
+    }
+
+    bool front_at(char side, uint32_t price, uint64_t& id) const{
+        const auto& side_map = (side == 'B') ? bids_ : asks_;
+        auto ite = side_map.find(price);
+        if(ite == side_map.end() || ite->second.empty()) return false;
+        id = ite->second.front();
+        return true;
+    }
+
+
 
 
     //Helper functions:
